@@ -16,20 +16,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // For metadata API
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	v1 "k8s.io/api/core/v1"
 )
 
-// DeploymentInfo holds information about a deployment and its resources.
 type DeploymentInfo struct {
-	Name          string
-	Namespace     string
-	Replicas      int32
-	CPURequest    string
-	CPULimit      string
-	MemoryRequest string
-	MemoryLimit   string
-	MinReplicas   int32
-	MaxReplicas   int32
-	IsUpdated     string
+	Name                   string
+	Namespace              string
+	Replicas               int32
+	MinReplicas            int32
+	MaxReplicas            int32
+	CPURequest             string
+	CPULimit               string
+	MemoryRequest          string
+	MemoryLimit            string
+	MaxUnavailable		   string
+	MaxSurge			   string
+	CPUTargetUtilization   int32
+	ScaleUpStabilization   *int32
+	ScaleDownStabilization *int32
+	UpdateResourceAndHPA   string
+	UpdateHPAOnly          string
 }
 
 // initializes a Kubernetes client using the default kubeconfig.
@@ -68,7 +75,6 @@ func getActiveNamespace(kubeconfig string) string {
 	return contextConfig.Namespace
 }
 
-// getDeploymentInfo fetches details about deployments and their associated HPA configs.
 func getDeploymentInfo(clientset *kubernetes.Clientset, namespace string) ([]DeploymentInfo, error) {
 	var results []DeploymentInfo
 
@@ -79,7 +85,7 @@ func getDeploymentInfo(clientset *kubernetes.Clientset, namespace string) ([]Dep
 	}
 
 	// List all HPAs in the namespace.
-	hpaList, err := clientset.AutoscalingV1().HorizontalPodAutoscalers(namespace).List(context.TODO(), metav1.ListOptions{})
+	hpaList, err := clientset.AutoscalingV2().HorizontalPodAutoscalers(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("💢 failed to list HPAs: %w", err)
 	}
@@ -107,6 +113,20 @@ func getDeploymentInfo(clientset *kubernetes.Clientset, namespace string) ([]Dep
 		info.MemoryRequest = fmt.Sprintf("%dMi", totalMemoryRequest)
 		info.MemoryLimit = fmt.Sprintf("%dMi", totalMemoryLimit)
 
+
+		// Get `maxUnavailable` dan `maxSurge` dari RollingUpdate Strategy
+		if deploy.Spec.Strategy.Type == "RollingUpdate" {
+			if deploy.Spec.Strategy.RollingUpdate != nil {
+				if deploy.Spec.Strategy.RollingUpdate.MaxUnavailable != nil {
+					info.MaxUnavailable = deploy.Spec.Strategy.RollingUpdate.MaxUnavailable.String()
+				}
+
+				if deploy.Spec.Strategy.RollingUpdate.MaxSurge != nil {
+					info.MaxSurge = deploy.Spec.Strategy.RollingUpdate.MaxSurge.String()
+				} 
+			}
+		}
+
 		// Match HPA with the deployment (if available).
 		for _, hpa := range hpaList.Items {
 			if hpa.Spec.ScaleTargetRef.Name == deploy.Name && hpa.Spec.ScaleTargetRef.Kind == "Deployment" {
@@ -116,6 +136,28 @@ func getDeploymentInfo(clientset *kubernetes.Clientset, namespace string) ([]Dep
 					info.MinReplicas = 1 // Default to 1 if MinReplicas is not set.
 				}
 				info.MaxReplicas = hpa.Spec.MaxReplicas
+
+				// Extract CPU target utilization
+				for _, metric := range hpa.Spec.Metrics {
+					if metric.Type == autoscalingv2.ResourceMetricSourceType && metric.Resource != nil {
+						if metric.Resource.Name == v1.ResourceCPU && metric.Resource.Target.AverageUtilization != nil {
+							info.CPUTargetUtilization = *metric.Resource.Target.AverageUtilization
+						}
+					}
+				}
+
+				// Extract ScaleUp and ScaleDown behaviors
+				if hpa.Spec.Behavior != nil {
+					// ScaleUp
+					if hpa.Spec.Behavior.ScaleUp != nil {
+						info.ScaleUpStabilization = hpa.Spec.Behavior.ScaleUp.StabilizationWindowSeconds
+					}
+
+					// ScaleDown
+					if hpa.Spec.Behavior.ScaleDown != nil {
+						info.ScaleDownStabilization = hpa.Spec.Behavior.ScaleDown.StabilizationWindowSeconds
+					}
+				}
 				break
 			}
 		}
@@ -127,7 +169,7 @@ func getDeploymentInfo(clientset *kubernetes.Clientset, namespace string) ([]Dep
 
 // writeCSV saves the DeploymentInfo data into a CSV file with progress animation.
 func writeCSV(data []DeploymentInfo) error {
-	file, err := os.Create("deployment-info.csv")
+	file, err := os.Create("deployment-info-test.csv")
 	if err != nil {
 		return fmt.Errorf("failed to create CSV file: %w", err)
 	}
@@ -141,7 +183,8 @@ func writeCSV(data []DeploymentInfo) error {
 	if err := writer.Write([]string{
 		"No", "Deployment Name", "Namespace", "Replicas",
 		"CPU Request", "CPU Limit", "Memory Request", "Memory Limit",
-		"Min Replicas", "Max Replicas", "IsUpdated",
+		"MaxUnavailable", "MaxSurge", "Min Replicas", "Max Replicas", "CPU Target Utilization", "ScaleUp Stabilization", 
+		"ScaleDown Stabilization", "UpdateResourceAndHPA", "UpdateHPAOnly",
 	}); err != nil {
 		return fmt.Errorf("failed to write CSV header: %w", err)
 	}
@@ -149,7 +192,7 @@ func writeCSV(data []DeploymentInfo) error {
 	// Write each DeploymentInfo as a row in the CSV with progress messages.
 	for i, deploy := range data {
 		record := []string{
-			strconv.Itoa(i + 1), // Add the row number (starting from 1).
+			strconv.Itoa(i + 1), // Row number (starting from 1)
 			deploy.Name,
 			deploy.Namespace,
 			strconv.Itoa(int(deploy.Replicas)),
@@ -157,10 +200,32 @@ func writeCSV(data []DeploymentInfo) error {
 			deploy.CPULimit,
 			deploy.MemoryRequest,
 			deploy.MemoryLimit,
+			deploy.MaxUnavailable,
+			deploy.MaxSurge,
 			strconv.Itoa(int(deploy.MinReplicas)),
 			strconv.Itoa(int(deploy.MaxReplicas)),
+			strconv.Itoa(int(deploy.CPUTargetUtilization)),
+		
+			// Check if ScaleUpStabilization is nil before converting it to a string
+			func() string {
+				if deploy.ScaleUpStabilization != nil {
+					return strconv.Itoa(int(*deploy.ScaleUpStabilization))
+				}
+				return "N/A" // Default value if nil
+			}(),
+
+			// Check if ScaleDownStabilization is nil before converting it to a string
+			func() string {
+				if deploy.ScaleDownStabilization != nil {
+					return strconv.Itoa(int(*deploy.ScaleDownStabilization))
+				}
+				return "N/A"
+			}(),
+
+			"false",
 			"false",
 		}
+
 		if err := writer.Write(record); err != nil {
 			return fmt.Errorf("failed to write CSV record: %w", err)
 		}
@@ -277,7 +342,7 @@ func restartDeployment(deploymentName string) error {
 
 // PATCH: Function for action 2 - Update Kubernetes specs from CSV
 func patchKubeResourcesFromCSV() error {
-	file, err := os.Open("deployment-info.csv")
+	file, err := os.Open("deployment-info-test.csv")
 	if err != nil {
 		return fmt.Errorf("failed to open CSV file: %w", err)
 	}
@@ -299,29 +364,41 @@ func patchKubeResourcesFromCSV() error {
 			return fmt.Errorf("error reading CSV: %w", err)
 		}
 
-		// Extract data from CSV row
-		if strings.ToLower(record[10]) == "true" {
-			deploymentName := record[1]
-			namespace := record[2]
-			cpuRequest := record[4]
-			//cpuLimit := record[5]
-			memoryRequest := record[6]
-			memoryLimit := record[7]
-			minReplicas, _ := strconv.Atoi(record[8])
-			maxReplicas, _ := strconv.Atoi(record[9])
+		deploymentName := record[1]
+		namespace := record[2]
+		cpuRequest := record[4]
+		//cpuLimit := record[5]
+		memoryRequest := record[6]
+		memoryLimit := record[7]
+		maxUnavailable := record[8]
+		maxSurge := record[9]
+		minReplicas, _ := strconv.Atoi(record[10])
+		maxReplicas, _ := strconv.Atoi(record[11])
+		cpuTargetUtilization, _ := strconv.Atoi(record[12])
+		scaleUpStabilization, _ := strconv.Atoi(record[13])
+		scaleDownStabilization, _ := strconv.Atoi(record[14])
 
+		// Extract data from CSV row
+		if strings.ToLower(record[15]) == "true" { // UpdateResourceAndHPA 
 			//Run kubectl commands to update deployment resources
-			err = setDeploymentResources(namespace, deploymentName, cpuRequest, memoryRequest, memoryLimit)
+			err = setDeploymentResources(namespace, deploymentName, cpuRequest, memoryRequest, memoryLimit, maxUnavailable, maxSurge)
 			if err != nil {
 				fmt.Printf("\n💢 failed to set resources for deployment %s: %v\n", deploymentName, err)
 			}
 
 			// Run kubectl command to patch HPA
-			err = patchHPA(deploymentName, namespace, minReplicas, maxReplicas)
+			err = patchHPA(deploymentName, namespace, minReplicas, maxReplicas, cpuTargetUtilization, scaleUpStabilization, scaleDownStabilization)
+			if err != nil {
+				fmt.Printf("\n💢 failed to patch HPA for %s: %v\n", deploymentName, err)
+			}
+		} else if strings.ToLower(record[16]) == "true" { // UpdateHPAOnly
+			// Run kubectl command to patch HPA
+			err = patchHPA(deploymentName, namespace, minReplicas, maxReplicas, cpuTargetUtilization, scaleUpStabilization, scaleDownStabilization)
 			if err != nil {
 				fmt.Printf("\n💢 failed to patch HPA for %s: %v\n", deploymentName, err)
 			}
 		}
+
 	}
 
 	fmt.Println("✅ Kubernetes specs updated successfully!")
@@ -329,7 +406,7 @@ func patchKubeResourcesFromCSV() error {
 }
 
 // Helper function to set deployment resources using kubectl
-func setDeploymentResources(namespace, deploymentName, cpuReq, memReq, memLim string) error {
+func setDeploymentResources(namespace, deploymentName, cpuReq, memReq, memLim, maxUnavailable, maxSurge string) error {
 	cmd := exec.Command(
 		"kubectl", "set", "resources", "deployment", deploymentName,
 		"--namespace="+namespace,
@@ -344,23 +421,44 @@ func setDeploymentResources(namespace, deploymentName, cpuReq, memReq, memLim st
 		return fmt.Errorf("kubectl set resources error: %v\n%s", err, string(output))
 	}
 	fmt.Printf("✅ Resources updated for deployment %s\n", deploymentName)
+
+	// Update rolling update strategy
+	patchData := fmt.Sprintf(`{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":"%s","maxSurge":"%s"}}}}`, maxUnavailable, maxSurge)
+
+	cmd = exec.Command(
+		"kubectl", "patch", "deployment", deploymentName, 
+		"--namespace="+namespace, 
+		"--type=merge", "-p", patchData)
+
+	fmt.Println("\n💻 Executing command: ", cmd.String())	
+
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("kubectl patch rolling update error: %v\n%s", err, string(output))
+	}
+	fmt.Printf("✅ Rolling updated for deployment %s\n", deploymentName)
+
 	return nil
 }
 
 // Helper function to patch HPA using kubectl
-func patchHPA(hpaName, namespace string, minReplicas, maxReplicas int) error {
-	patchData := fmt.Sprintf(`{"spec":{"minReplicas":%d,"maxReplicas":%d}}`, minReplicas, maxReplicas)
+func patchHPA(hpaName, namespace string, minReplicas, maxReplicas, cpuTargetUtilization, scaleUpStabilization, scaleDownStabilization int) error {
+	// Create JSON patch data
+	patchData := fmt.Sprintf(`{"spec":{"minReplicas":%d,"maxReplicas":%d,"metrics":[{"type":"Resource","resource":{"name":"cpu","target":{"type":"Utilization","averageUtilization":%d}}}],"behavior":{"scaleUp":{"stabilizationWindowSeconds":%d},"scaleDown":{"stabilizationWindowSeconds":%d}}}}`, minReplicas, maxReplicas, cpuTargetUtilization, scaleUpStabilization, scaleDownStabilization)
+
 	cmd := exec.Command(
 		"kubectl", "patch", "hpa", hpaName,
 		"--namespace="+namespace,
-		"--patch="+patchData,
-	)
+		"--type=merge", "-p", patchData)
+	
+	fmt.Println("\n💻 Executing command: ", cmd.String())
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("💢 kubectl patch hpa error: %v\n%s", err, string(output))
 	}
 	fmt.Printf("✅ HPA patched for %s\n", hpaName)
+
 	return nil
 }
 
