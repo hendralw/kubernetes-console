@@ -169,7 +169,7 @@ func getDeploymentInfo(clientset *kubernetes.Clientset, namespace string) ([]Dep
 
 // writeCSV saves the DeploymentInfo data into a CSV file with progress animation.
 func writeCSV(data []DeploymentInfo) error {
-	file, err := os.Create("deployment-info-test.csv")
+	file, err := os.Create("deployment-info.csv")
 	if err != nil {
 		return fmt.Errorf("failed to create CSV file: %w", err)
 	}
@@ -342,7 +342,7 @@ func restartDeployment(deploymentName string) error {
 
 // PATCH: Function for action 2 - Update Kubernetes specs from CSV
 func patchKubeResourcesFromCSV() error {
-	file, err := os.Open("deployment-info-test.csv")
+	file, err := os.Open("deployment-info.csv")
 	if err != nil {
 		return fmt.Errorf("failed to open CSV file: %w", err)
 	}
